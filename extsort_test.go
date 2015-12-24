@@ -29,6 +29,7 @@ func TestExtSort(t *testing.T) {
 			inputChan <- test
 		}
 		close(inputChan)
+		fmt.Println("done starting input")
 	}()
 
 	extSorter := ExternalSorter{inputChan, 3}

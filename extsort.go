@@ -1,15 +1,28 @@
 package extsort
 
-import "bufio"
-import "sync"
-import "sort"
-import "encoding"
-import "fmt"
-import "io/ioutil"
+import (
+	"bufio"
+	//"container/heap"
+	"encoding"
+	"io"
+	"io/ioutil"
+	"log"
+	"os"
+	"sort"
+	"sync"
+)
 
 const (
+	// Default number of sortable entries to store per
+	// file on disk.
 	DefaultItemsPerExtFile = 3
 )
+
+var logger *log.Logger
+
+func init() {
+	logger = log.New(os.Stdout, "extsort: ", log.Lshortfile|log.Ldate)
+}
 
 // Any type that satisfies Interface can be sorted externally (on disk)
 // using this package. This interface simply indicates that
@@ -20,23 +33,49 @@ type Interface interface {
 	encoding.BinaryUnmarshaler
 }
 
+// Struct to manage external sorting
 type ExternalSorter struct {
-	input    <-chan Interface
+	// Channel which will be used to receive the (unsorted) input data.
+	input <-chan Interface
+
+	// Number of goroutines to use for sorting.
 	poolSize int
 }
 
-type inMemSorter []Interface
+type sortableList []Interface
 
-func (ims inMemSorter) Len() int {
+func (ims sortableList) Len() int {
 	return len(ims)
 }
 
-func (ims inMemSorter) Less(i, j int) bool {
+func (ims sortableList) Less(i, j int) bool {
 	return ims[i].LessThan(ims[j])
 }
 
-func (ims inMemSorter) Swap(i, j int) {
+func (ims sortableList) Swap(i, j int) {
 	ims[i], ims[j] = ims[j], ims[i]
+}
+
+func (ims sortableList) Marshal(out io.Writer) (int, error) {
+	written := 0
+	var n int
+	for _, item := range ims {
+		b, err := item.MarshalBinary()
+		if err != nil {
+			return written, err
+		}
+		n, err = out.Write(encodeUInt32(uint32(len(b))))
+		written += n
+		if err != nil {
+			return written, err
+		}
+		n, err = out.Write(b)
+		written += n
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
 }
 
 type extSorterResult struct {
@@ -45,135 +84,227 @@ type extSorterResult struct {
 	error
 }
 
-func (es ExternalSorter) Sort(out <-chan Interface) error {
-	results := make(chan extSorterResult)
-	workerWG := sync.WaitGroup{}
-	// Start up a bunch of workers
-
-	poolSize := 1
-	for i := 0; i < poolSize; i++ {
-		fmt.Println("starting worker", i)
-		sorter := subsetSorter{es.input, 0}
-		workerWG.Add(1)
-		go runSortWorker(sorter, results)
-	}
-
-	// set up channel to be notified when all workers are done (i.e. the input channel is empty)
-	allWorkersDone := make(chan struct{})
-	go func() {
-		fmt.Println("waiting on the WG")
-		workerWG.Wait()
-		close(results)
-		allWorkersDone <- struct{}{}
-	}()
-
-	collectedResults := []extSorterResult{}
-	resultsDone := make(chan struct{})
-	// Collect results as they are delivered from the workers.
-	go func() {
-		fmt.Println("starting loop over results!")
-		inputFinished := false
-		for {
-			select {
-			case r := <-results:
-				fmt.Println("got a result!")
-				collectedResults = append(collectedResults, r)
-				if r.exhausted {
-					inputFinished = false
-					workerWG.Done()
-				} else {
-					if !inputFinished {
-						// there could be more input data, so start a new worker in the pool
-						sorter := subsetSorter{es.input, 0}
-						go runSortWorker(sorter, results)
-					}
-				}
-			case <-allWorkersDone:
-				resultsDone <- struct{}{}
-				return
-			}
-		}
-	}()
-
-	<-resultsDone
-	fmt.Printf("results are %#v\n", collectedResults)
-	return nil
-
+func newIterator(files []string) *Iterator {
+	return &Iterator{files, nil, nil, 0, nil, nil}
 }
 
-func runSortWorker(sorter subsetSorter, out chan extSorterResult) {
-	fmt.Println("running worker!")
-	outfile, exhausted, err := sorter.do()
-	fmt.Println("worker is done!")
-	out <- extSorterResult{outfile, exhausted, err}
-	fmt.Println("done in worker helper")
+type Iterator struct {
+	files        []string
+	streams      []subsetReader
+	current      io.Reader
+	currentIndex int
+	err          error
+	mergerHeap   sortableList
+}
+
+func (it *Iterator) init() error {
+	//TODO panic if already init'd
+	it.mergerHeap = sortableList(make([]Interface, len(it.files)))
+	it.streams = make([]subsetReader, 0, len(it.files))
+	for _, file := range it.files {
+		newstream := subsetReader{file, nil}
+		err := newstream.Open()
+		if err != nil {
+			return err
+		}
+		it.streams = append(it.streams, newstream)
+	}
+	return nil
+}
+
+/*
+func (it *Iterator) Next(into Interface) bool {
+	if current == nil {
+		if currentIndex >= files.length {
+			return false
+		}
+		current, err := os.Open(files[current])
+		if err != nil {
+			it.err = err
+			return false
+		}
+	}
+		logger.Println("got file", filename)
+		sortedBlockReader := subsetReader{filename, nil}
+		err := sortedBlockReader.Open()
+		if err != nil {
+			// TODO proper error handling here
+			logger.Println("error from reader", err)
+			return
+		}
+}
+*/
+
+func (es ExternalSorter) Sort() *Iterator {
+	sortedChunks := make(chan sortableList)
+	results := make(chan string)
+	sorterPoolSize := 1
+	writerPoolSize := 1
+
+	// Goroutine pool for sorting groups of incoming data
+	sorterWG := sync.WaitGroup{}
+	for i := 0; i < sorterPoolSize; i++ {
+		logger.Println("starting sort worker", i)
+		sorter := subsetSorter{es.input, sortedChunks, 0}
+		sorterWG.Add(1)
+		go func() {
+			sorter.do()
+			sorterWG.Done()
+		}()
+	}
+
+	// Goroutine pool for writing grouped blocks to disk
+	writerWG := sync.WaitGroup{}
+	for i := 0; i < writerPoolSize; i++ {
+		logger.Println("starting write worker", i)
+		writer := subsetWriter{sortedChunks, results}
+		writerWG.Add(1)
+		go func() {
+			writer.Do()
+			writerWG.Done()
+		}()
+	}
+
+	go func() {
+		sorterWG.Wait()
+		close(sortedChunks)
+	}()
+
+	go func() {
+		writerWG.Wait()
+		close(results)
+	}()
+
+	collectedResults := []string{}
+	// Goroutine for collecting location of serialized blocks
+	for filename := range results {
+		collectedResults = append(collectedResults, filename)
+	}
+
+	//TODO Refactor so that no workers start until the first call to iterator.Next()
+	return Iterator{collectedResults}
+
+	return nil
+}
+
+type subsetWriter struct {
+	in  <-chan sortableList
+	out chan<- string
+}
+
+type subsetReader struct {
+	filename string
+	r        io.ReadCloser
+}
+
+func (ssr subsetReader) Open() error {
+	var err error
+	ssr.r, err = os.Open(filename)
+	if err != nil {
+		return err
+	}
+}
+
+func (ssr subsetReader) Close() error {
+	return ssr.r.Close()
+}
+
+func (ssr subsetReader) Next(dest Interface) error {
+	// TODO allocate this buffer once per reader, and re-use it to avoid excessive allocations
+	into := make([]byte, 4)
+
+	// read object size (a 4 byte integer)
+	_, err := io.ReadAtLeast(ssr.r, into[0:4], 4)
+	if err != nil {
+		if err != io.EOF {
+			return nil, err
+		}
+		// we hit EOF right away, so we're at the end of the stream.
+		bs.err = nil
+		return nil, nil
+	}
+	size := decodeUInt32(into)
+
+	// TODO We can optimize this by allocating only one slice per reader, to the maximum size
+	// that will be needed for all items in  the file. This could be calculated during the
+	// sorting phase, then stored per segment in a header, and read back during Open().
+	raw := make([]byte, 0, size)
+	n, err = io.ReadAtLeast(ssr.r, raw, size)
+	if err != nil {
+		if err != io.EOF {
+			return nil, err
+		}
+		// we hit EOF but didn't get a full item from the stream, so something is f'd up.
+		return nil.fmt.Errorf("Corrupt stream: expected %v bytes but got only %v", size, n)
+	}
+
+	err = dest.UnmarshalBinary(raw)
+	return err
+}
+
+func (ssw subsetWriter) Do() error {
+	for sortedBlock := range ssw.in {
+		logger.Println("got a block to write!")
+		// write them to disk
+		f, err := ioutil.TempFile("", "extsort_")
+		if err != nil {
+			return err
+		}
+		w := bufio.NewWriter(f)
+		_, err = sortedBlock.Marshal(w)
+		if err != nil {
+			logger.Println("got err", err)
+			f.Close()
+			return err
+		}
+		w.Flush()
+		f.Close()
+		ssw.out <- f.Name()
+	}
+	logger.Println("writer exiting!")
+	return nil
 }
 
 type subsetSorter struct {
 	in       <-chan Interface
+	out      chan sortableList
 	maxItems int
 }
 
-func (sss subsetSorter) do() (outfile string, exhausted bool, err error) {
+func (sss subsetSorter) do() {
 	if sss.maxItems <= 0 {
 		sss.maxItems = DefaultItemsPerExtFile
 	}
-	container := inMemSorter(make([]Interface, 0, DefaultItemsPerExtFile))
+	container := sortableList(make([]Interface, 0, DefaultItemsPerExtFile))
 	numItems := 0
-	exhausted = true
-	// read up to maxItems from the channel
-	for x := range sss.in {
-		numItems++
-		fmt.Println("got an input")
-		container = append(container, x)
-		if numItems >= sss.maxItems {
-			exhausted = false
-			break
+	exhausted := true
+	for {
+		numFound := 0
+		// read up to maxItems from the channel
+		for x := range sss.in {
+			numFound++
+			numItems++
+			logger.Println("got an input", numItems)
+			container = append(container, x)
+			if numItems >= sss.maxItems {
+				logger.Println("got enough, breaking", numItems)
+				exhausted = false
+				break
+			}
+		}
+		if numFound == 0 {
+			return
+		}
+		logger.Println("sorting!")
+
+		// sort them
+		sort.Sort(container)
+
+		sss.out <- container
+		if exhausted {
+			return
 		}
 	}
-	fmt.Println("sorting!")
-
-	// sort them
-	sort.Sort(container)
-
-	// write them to disk
-	f, err := ioutil.TempFile("", "extsort_")
-	if err != nil {
-		return "", exhausted, err
-	}
-	w := bufio.NewWriter(f)
-	fmt.Println("writing file to ", f.Name())
-
-	defer func() {
-		// Always try to close the file when returning,
-		// but when already returning a non-nil error, always
-		// return that first instead of any error from .Close().
-		cerr := f.Close()
-		if err == nil {
-			err = cerr
-		}
-	}()
-
-	for _, i := range container {
-		b, err := i.MarshalBinary()
-		if err != nil {
-			return "", exhausted, err
-		}
-		_, err = w.Write(encodeUInt32(uint32(len(b))))
-		if err != nil {
-			return f.Name(), exhausted, err
-		}
-		_, err = w.Write(b)
-		if err != nil {
-			return f.Name(), exhausted, err
-		}
-	}
-	err = w.Flush()
-	if err != nil {
-		return f.Name(), exhausted, err
-	}
-	return f.Name(), exhausted, nil
-
 }
 
 // TODO use protobuf ints instead.
